@@ -1,0 +1,287 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#include "surface.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0, rgba16f) uniform image2D illumination;
+layout(binding = 1) uniform accelerationStructureEXT topLevel;
+layout(binding = 2, std430) readonly buffer Geometry { vec4 vertexEntries[]; };
+layout(binding = 3, rgba16f) uniform image2D albedoTarget;
+layout(binding = 4, rgba16f) uniform image2D fogTarget;
+layout(binding = 5, std430) readonly buffer Exhausts { vec4 exhausts[]; };
+layout(binding = 6, std430) readonly buffer Instances { vec4 instanceFacts[]; };
+
+layout(push_constant) uniform Push {
+    vec4 origin;
+    vec4 right;
+    vec4 up;
+    vec4 forward;
+    vec4 star;
+    vec4 starEmission;
+    vec4 medium;
+    vec4 exhaust;
+};
+
+const float PI = 3.14159265;
+const uint BOUNCES = 4;
+
+uint pcg(inout uint state) {
+    state = state * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float uniformFloat(inout uint state) {
+    return float(pcg(state)) * (1.0 / 4294967296.0);
+}
+
+float interleavedGradient(ivec2 pixel) {
+    return fract(52.9829189 * fract(0.06711056 * float(pixel.x) + 0.00583715 * float(pixel.y)));
+}
+
+void basisAround(vec3 axis, out vec3 tangent, out vec3 bitangent) {
+    vec3 helper = abs(axis.x) > 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    tangent = normalize(cross(helper, axis));
+    bitangent = cross(axis, tangent);
+}
+
+vec3 cosineHemisphere(vec3 normal, inout uint state) {
+    float u1 = uniformFloat(state);
+    float u2 = uniformFloat(state);
+    float radius = sqrt(u1);
+    float phi = 2.0 * PI * u2;
+    vec3 tangent;
+    vec3 bitangent;
+    basisAround(normal, tangent, bitangent);
+    return normalize(tangent * (radius * cos(phi)) + bitangent * (radius * sin(phi)) + normal * sqrt(max(0.0, 1.0 - u1)));
+}
+
+vec3 sampleSpecular(vec3 normal, vec3 outgoing, float roughness, inout uint state) {
+    float width = max(roughness * roughness, 0.004);
+    float u1 = uniformFloat(state);
+    float u2 = uniformFloat(state);
+    float cosTheta = sqrt((1.0 - u1) / (1.0 + (width * width - 1.0) * u1));
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+    float phi = 2.0 * PI * u2;
+    vec3 tangent;
+    vec3 bitangent;
+    basisAround(normal, tangent, bitangent);
+    vec3 halfway = normalize(tangent * (sinTheta * cos(phi)) + bitangent * (sinTheta * sin(phi)) + normal * cosTheta);
+    return reflect(-outgoing, halfway);
+}
+
+bool occluded(vec3 position, vec3 direction, float rayLength) {
+    if (rayLength <= 0.05) {
+        return false;
+    }
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, topLevel, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, position, 0.05, direction, rayLength);
+    while (rayQueryProceedEXT(query)) {}
+    return rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+float starSolidAngle(float centreDistance) {
+    float cosMaximum = sqrt(max(0.0, 1.0 - star.w * star.w / (centreDistance * centreDistance)));
+    return 2.0 * PI * (1.0 - cosMaximum);
+}
+
+vec3 sampleStar(vec3 position, vec3 normal, inout uint state, out vec3 lightDirection) {
+    vec3 toStar = star.xyz - position;
+    float centreDistance = length(toStar);
+    lightDirection = toStar / centreDistance;
+    if (centreDistance <= star.w) {
+        return vec3(0.0);
+    }
+    vec3 axis = lightDirection;
+    float cosMaximum = sqrt(max(0.0, 1.0 - star.w * star.w / (centreDistance * centreDistance)));
+    float cosTheta = 1.0 - uniformFloat(state) * (1.0 - cosMaximum);
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+    float phi = 2.0 * PI * uniformFloat(state);
+    vec3 tangent;
+    vec3 bitangent;
+    basisAround(axis, tangent, bitangent);
+    lightDirection = normalize(tangent * (sinTheta * cos(phi)) + bitangent * (sinTheta * sin(phi)) + axis * cosTheta);
+    if (dot(normal, lightDirection) <= 0.0) {
+        return vec3(0.0);
+    }
+    float offset = max(0.05, length(position) * 2.0e-5);
+    if (occluded(position + normal * offset, lightDirection, centreDistance - star.w - offset)) {
+        return vec3(0.0);
+    }
+    return starEmission.rgb * (2.0 * PI * (1.0 - cosMaximum));
+}
+
+float henyeyGreenstein(float cosine, float g) {
+    float denominator = 1.0 + g * g - 2.0 * g * cosine;
+    return (1.0 - g * g) / (4.0 * PI * denominator * sqrt(max(denominator, 1e-6)));
+}
+
+vec3 exhaustGlow(vec3 rayDirection, float far) {
+    uint count = uint(exhaust.x);
+    vec3 total = vec3(0.0);
+    for (uint i = 0; i < count; i++) {
+        vec4 flame = exhausts[i];
+        float along = dot(flame.xyz, rayDirection);
+        float perpendicular = max(dot(flame.xyz, flame.xyz) - along * along, 1.0);
+        float height = sqrt(perpendicular);
+        float span = atan((far - along) / height) - atan(-along / height);
+        if (span <= 0.0) {
+            continue;
+        }
+        vec3 closest = rayDirection * clamp(along, 0.0, far);
+        float phase = henyeyGreenstein(dot(rayDirection, normalize(flame.xyz - closest)), medium.y);
+        total += flame.w * phase * span / height;
+    }
+    return total * medium.x * vec3(0.34, 0.62, 1.00);
+}
+
+vec4 marchMedium(vec3 rayDirection, float surfaceDistance, ivec2 pixel) {
+    float scattering = medium.x;
+    float far = min(surfaceDistance, medium.w);
+    if (scattering <= 0.0 || far <= 1.0) {
+        return vec4(0.0, 0.0, 0.0, 1.0);
+    }
+    vec3 glow = exhaustGlow(rayDirection, far);
+    int steps = int(medium.z);
+    float ratio = pow(far, 1.0 / float(steps));
+    float dither = interleavedGradient(pixel);
+    vec3 inScatter = vec3(0.0);
+    float transmittance = 1.0;
+    float entry = 1.0;
+    for (int i = 0; i < steps; i++) {
+        float leave = entry * ratio;
+        float stepLength = leave - entry;
+        vec3 position = rayDirection * (entry + stepLength * dither);
+        entry = leave;
+        vec3 toStar = star.xyz - position;
+        float centreDistance = length(toStar);
+        vec3 lightDirection = toStar / centreDistance;
+        if (!occluded(position, lightDirection, min(centreDistance - star.w, medium.w))) {
+            float phase = henyeyGreenstein(dot(rayDirection, lightDirection), medium.y);
+            inScatter += transmittance * scattering * stepLength * phase * starSolidAngle(centreDistance) * starEmission.rgb;
+        }
+        transmittance *= exp(-scattering * stepLength);
+    }
+    return vec4(inScatter + glow, transmittance);
+}
+
+vec3 tracePath(vec3 rayDirection, inout uint state, out vec3 primaryAlbedo, out float primaryDistance) {
+    vec3 rayOrigin = origin.xyz;
+    primaryDistance = 1.0e13;
+    primaryAlbedo = vec3(0.0);
+    vec3 accumulated = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+    for (uint bounce = 0; bounce < BOUNCES; bounce++) {
+        rayQueryEXT query;
+        rayQueryInitializeEXT(query, topLevel, gl_RayFlagsNoneEXT, 0xFF, rayOrigin, 0.05, rayDirection, 1.0e13);
+        while (rayQueryProceedEXT(query)) {
+            float ceiling = instanceFacts[rayQueryGetIntersectionInstanceIdEXT(query, false) * 2u].z;
+            vec3 objectOrigin = rayQueryGetIntersectionObjectRayOriginEXT(query, false);
+            vec3 objectDirection = rayQueryGetIntersectionObjectRayDirectionEXT(query, false);
+            if (objectOrigin.y + objectDirection.y * rayQueryGetIntersectionTEXT(query, false) <= ceiling) {
+                rayQueryConfirmIntersectionEXT(query);
+            }
+        }
+        if (rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+            if (bounce > 0) {
+                accumulated += throughput * (starfield(rayDirection) + AMBIENT);
+            }
+            break;
+        }
+        uint instanceId = uint(rayQueryGetIntersectionInstanceIdEXT(query, true)) * 2u;
+        vec4 facts = instanceFacts[instanceId];
+        vec4 motion = instanceFacts[instanceId + 1u];
+        uint material = uint(facts.y);
+        uint vertexBase = uint(facts.x);
+        vec3 albedo;
+        vec3 emission;
+        materialOf(material, albedo, emission);
+        float metallic = 0.0;
+        float roughness = 1.0;
+        float hitDistance = rayQueryGetIntersectionTEXT(query, true);
+        vec3 position = rayOrigin + rayDirection * hitDistance;
+        float offset = max(0.05, length(position) * 2.0e-5);
+        vec3 normal;
+        mat4x3 objectToWorld = rayQueryGetIntersectionObjectToWorldEXT(query, true);
+        if (vertexBase == 0u) {
+            normal = normalize(position - objectToWorld[3]);
+        } else {
+            vec2 weights = rayQueryGetIntersectionBarycentricsEXT(query, true);
+            uint slot = (vertexBase + uint(rayQueryGetIntersectionPrimitiveIndexEXT(query, true)) * 3u) * 4u;
+            float weight0 = 1.0 - weights.x - weights.y;
+            vec3 objectNormal = vertexEntries[slot + 1u].xyz * weight0 +
+                                vertexEntries[slot + 5u].xyz * weights.x +
+                                vertexEntries[slot + 9u].xyz * weights.y;
+            normal = normalize(mat3(objectToWorld) * objectNormal);
+            vec4 surface = vertexEntries[slot + 2u];
+            if (surface.w >= 0.0) {
+                surface = surface * weight0 + vertexEntries[slot + 6u] * weights.x + vertexEntries[slot + 10u] * weights.y;
+                vec4 physical = vertexEntries[slot + 3u] * weight0 + vertexEntries[slot + 7u] * weights.x +
+                                vertexEntries[slot + 11u] * weights.y;
+                albedo = surface.rgb;
+                emission = surface.rgb * surface.w;
+                metallic = physical.x;
+                roughness = physical.y;
+                vec3 objectPoint = rayQueryGetIntersectionObjectRayOriginEXT(query, true) +
+                                   rayQueryGetIntersectionObjectRayDirectionEXT(query, true) * hitDistance;
+                surfaceDetail(objectPoint, objectNormal, physical.z, physical.w,
+                              length(objectToWorld[0]), albedo, roughness);
+            }
+        }
+        if (dot(normal, rayDirection) > 0.0) {
+            normal = -normal;
+        }
+        emission *= facts.w;
+        if (motion.x > 0.5) {
+            float along = rayQueryGetIntersectionObjectRayOriginEXT(query, true).x +
+                          rayQueryGetIntersectionObjectRayDirectionEXT(query, true).x * hitDistance;
+            emission = animateEmission(emission, motion.x, along);
+        }
+        vec3 shading = albedo;
+        if (bounce == 0) {
+            primaryDistance = hitDistance;
+            primaryAlbedo = albedo;
+            shading = vec3(1.0);
+            if (emission.r + emission.g + emission.b > 0.0) {
+                primaryAlbedo = vec3(1.0);
+                accumulated = emission;
+                break;
+            }
+        }
+        vec3 lightDirection;
+        vec3 arriving = sampleStar(position, normal, state, lightDirection);
+        if (arriving.r + arriving.g + arriving.b > 0.0) {
+            accumulated += throughput * arriving * brdf(shading, metallic, roughness, normal, -rayDirection, lightDirection);
+        }
+        throughput *= shading;
+        rayOrigin = position + normal * offset;
+        if (uniformFloat(state) < metallic) {
+            vec3 specular = sampleSpecular(normal, -rayDirection, roughness, state);
+            rayDirection = dot(specular, normal) > 0.0 ? specular : reflect(rayDirection, normal);
+        } else {
+            rayDirection = cosineHemisphere(normal, state);
+        }
+    }
+    return accumulated;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(illumination);
+    if (pixel.x >= size.x || pixel.y >= size.y) {
+        return;
+    }
+    uint state = (uint(pixel.x) * 1973u + uint(pixel.y) * 9277u + floatBitsToUint(origin.w) * 26699u) | 1u;
+    vec2 ndc = (vec2(pixel) + 0.5) / vec2(size) * 2.0 - 1.0;
+    vec3 primaryDirection = normalize(forward.xyz + right.xyz * (ndc.x * right.w) - up.xyz * (ndc.y * up.w));
+    vec3 primaryAlbedo;
+    float primaryDistance;
+    vec3 light = tracePath(primaryDirection, state, primaryAlbedo, primaryDistance);
+    imageStore(illumination, pixel, vec4(light, 0.0));
+    imageStore(albedoTarget, pixel, vec4(primaryAlbedo, 0.0));
+    vec4 scattered = marchMedium(primaryDirection, primaryDistance, pixel);
+    if (primaryDistance > 1.0e12) {
+        scattered.rgb += starfield(primaryDirection) * scattered.a;
+    }
+    imageStore(fogTarget, pixel, scattered);
+}

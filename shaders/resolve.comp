@@ -1,0 +1,24 @@
+#version 460
+#include "surface.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0, rgba16f) uniform image2D illumination;
+layout(binding = 3, rgba16f) uniform image2D albedoTarget;
+layout(binding = 4, rgba16f) uniform image2D fogTarget;
+layout(binding = 7, rgba16f) uniform image2D outputTarget;
+
+layout(push_constant) uniform Push {
+    vec4 settings;
+};
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outputTarget);
+    if (pixel.x >= size.x || pixel.y >= size.y) {
+        return;
+    }
+    vec3 light = imageLoad(illumination, pixel).rgb;
+    vec3 albedo = imageLoad(albedoTarget, pixel).rgb;
+    vec4 fog = imageLoad(fogTarget, pixel);
+    imageStore(outputTarget, pixel, vec4(tonemap(light * albedo * fog.a + fog.rgb, settings.w), 1.0));
+}
